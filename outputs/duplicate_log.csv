@@ -1,0 +1,2 @@
+source_row,payment_id,department,payment_date,amount,business_id,clean_department,clean_date,amount_cents,duplicate_rank
+2,101,health,2026-09-01,1200.00,101,health,2026-09-01,120000,2

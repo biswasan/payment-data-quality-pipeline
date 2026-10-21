@@ -1,0 +1,7 @@
+source_row,payment_id,department,payment_date,amount,business_id,clean_department,clean_date,amount_cents,duplicate_rank,disposition
+11,,Health,2026-09-08,100,,health,2026-09-08,10000,1,Missing payment ID
+4,103,Health,2026-09-03,unknown,103,health,2026-09-03,,1,Invalid amount
+6,105,Health,2026-09-05,-75,105,health,2026-09-05,-7500,1,Negative amount: review
+7,106,Transport,2026-02-30,300,106,transport,,30000,1,Invalid date
+8,107,Education,2026-09-06,200,107,education,2026-09-06,20000,1,Conflicting payment ID
+9,107,Education,2026-09-06,250,107,education,2026-09-06,25000,1,Conflicting payment ID
