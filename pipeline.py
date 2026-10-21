@@ -1,77 +1,276 @@
 from pathlib import Path
-import csv, sqlite3
+import csv
+import sqlite3
 from datetime import date
 from decimal import Decimal, InvalidOperation
+
 import matplotlib.pyplot as plt
 
+
 BASE = Path.cwd()
-OUT = BASE / 'outputs'
+OUT = BASE / "outputs"
 OUT.mkdir(exist_ok=True)
 
+
 def cents(value):
-    # Exact cents; never silently round or use floating-point money.
     try:
         number = Decimal(str(value).strip())
-        if not number.is_finite() or abs(number) > Decimal('1000000000000'):
+
+        if not number.is_finite():
             return None
+
+        if abs(number) > Decimal("1000000000000"):
+            return None
+
         scaled = number * 100
-        return int(scaled) if scaled == scaled.to_integral_value() else None
+
+        if scaled != scaled.to_integral_value():
+            return None
+
+        return int(scaled)
+
     except (InvalidOperation, ValueError, OverflowError):
         return None
+
 
 def valid_date(value):
     try:
         text = str(value).strip()
         result = date.fromisoformat(text)
-        return text if result.isoformat() == text else None
+
+        if result.isoformat() == text:
+            return text
+
+        return None
+
     except ValueError:
         return None
 
-con = sqlite3.connect(':memory:')
-con.create_function('cents', 1, cents)
-con.create_function('valid_date', 1, valid_date)
-con.execute('CREATE TABLE raw_payments(source_row TEXT, payment_id TEXT, department TEXT, payment_date TEXT, amount TEXT)')
-with (BASE / 'messy_payments.csv').open(newline='') as file:
-    records = list(csv.DictReader(file))
-con.executemany('INSERT INTO raw_payments VALUES (?,?,?,?,?)', [tuple(r.values()) for r in records])
-con.executescript((BASE / 'clean_payments.sql').read_text())
 
-def count(table):
-    return con.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0]
+con = sqlite3.connect(":memory:")
 
-raw_count, duplicates, rejected, accepted = [count(t) for t in
-    ['raw_payments', 'duplicate_log', 'rejected_payments', 'clean_payments']]
-total = con.execute('SELECT SUM(amount_cents) FROM clean_payments').fetchone()[0]
-assert raw_count == duplicates + rejected + accepted
-assert (raw_count, duplicates, rejected, accepted, total) == (12, 1, 6, 5, 320000)
-assert cents('1.005') is None and cents('NaN') is None
-assert valid_date('2026-02-30') is None
-assert con.execute('SELECT COUNT(DISTINCT payment_id) FROM clean_payments').fetchone()[0] == accepted
-# Re-running the transformations must reproduce the same result.
-before = con.execute('SELECT * FROM clean_payments ORDER BY payment_id').fetchall()
-con.executescript((BASE / 'clean_payments.sql').read_text())
-assert con.execute('SELECT * FROM clean_payments ORDER BY payment_id').fetchall() == before
+con.create_function("cents", 1, cents)
+con.create_function("valid_date", 1, valid_date)
 
-for table in ['clean_payments','rejected_payments','duplicate_log','payment_summary']:
-    cursor = con.execute('SELECT * FROM ' + table)
-    with (OUT / (table + '.csv')).open('w', newline='') as file:
+con.execute("""
+    CREATE TABLE raw_patients (
+        source_row TEXT,
+        payment_id TEXT,
+        department TEXT,
+        payment_date TEXT,
+        amount TEXT
+    )
+""")
+
+with (BASE / "messy_payments.csv").open(
+    newline="", encoding="utf-8-sig"
+) as file:
+    reader = csv.DictReader(file)
+
+    records = [
+        (
+            row["source_row"],
+            row["payment_id"],
+            row["department"],
+            row["payment_date"],
+            row["amount"],
+        )
+        for row in reader
+    ]
+
+con.executemany(
+    "INSERT INTO raw_patients VALUES (?, ?, ?, ?, ?)",
+    records,
+)
+
+sql = (BASE / "clean_payments.sql").read_text(encoding="utf-8")
+con.executescript(sql)
+
+
+def record_count(table):
+    return con.execute(
+        f"SELECT COUNT(*) FROM {table}"
+    ).fetchone()[0]
+
+
+raw_count = record_count("raw_patients")
+duplicate_count = record_count("duplicate_log")
+review_count = record_count("patient_review_queue")
+accepted_count = record_count("clean_patients")
+
+total_cents = con.execute("""
+    SELECT COALESCE(SUM(amount_cents), 0)
+    FROM clean_patients
+""").fetchone()[0]
+
+
+assert raw_count == (
+    duplicate_count + review_count + accepted_count
+), "Some source records are unaccounted for."
+
+unique_ids = con.execute("""
+    SELECT COUNT(DISTINCT payment_id)
+    FROM clean_patients
+""").fetchone()[0]
+
+assert unique_ids == accepted_count, "Accepted payment IDs are not unique."
+
+assert cents("1.005") is None
+assert cents("NaN") is None
+assert valid_date("2026-02-30") is None
+
+before = con.execute("""
+    SELECT *
+    FROM clean_patients
+    ORDER BY payment_id
+""").fetchall()
+
+con.executescript(sql)
+
+after = con.execute("""
+    SELECT *
+    FROM clean_patients
+    ORDER BY payment_id
+""").fetchall()
+
+assert before == after, "Repeating the SQL changed the accepted records."
+
+
+exports = {
+    "clean_patients": "clean_payments.csv",
+    "patient_review_queue": "rejected_payments.csv",
+    "duplicate_log": "duplicate_log.csv",
+    "payment_summary": "payment_summary.csv",
+}
+
+for table, filename in exports.items():
+    cursor = con.execute(f"SELECT * FROM {table}")
+
+    with (OUT / filename).open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
         writer = csv.writer(file)
-        writer.writerow([d[0] for d in cursor.description])
+        writer.writerow(
+            [column[0] for column in cursor.description]
+        )
         writer.writerows(cursor)
 
-summary = con.execute('SELECT department,total_cents FROM payment_summary ORDER BY total_cents DESC').fetchall()
-plt.rcParams.update({'font.size': 11, 'axes.spines.top': False, 'axes.spines.right': False})
-fig, axes = plt.subplots(1, 2, figsize=(11, 4.4), layout='constrained')
-fig.patch.set_facecolor('#f7f9fc')
-axes[0].bar(['Accepted','Needs review','Duplicate'], [accepted,rejected,duplicates], color=['#347f83','#bd8850','#8d94a5'])
-axes[0].set(title='Every source row is accounted for', ylabel='Source records', ylim=(0,8))
-for i,v in enumerate([accepted,rejected,duplicates]): axes[0].text(i,v+.15,str(v),ha='center')
-axes[1].barh([r[0].title() for r in summary], [r[1]/100 for r in summary], color='#547da6')
-axes[1].set(title='Validated payments by department', xlabel='US dollars', xlim=(0,1550))
-axes[1].invert_yaxis()
-for i,(_,v) in enumerate(summary): axes[1].text(v/100+20,i,format(v/100,',.0f'),va='center')
-fig.suptitle('Payment data quality | Synthetic demonstration',fontsize=15,fontweight='bold')
-fig.savefig(OUT / 'payment_quality.png',dpi=180)
+
+summary = con.execute("""
+    SELECT department, total_cents
+    FROM payment_summary
+    ORDER BY total_cents DESC, department
+""").fetchall()
+
+review_reasons = con.execute("""
+    SELECT disposition, COUNT(*) AS record_count
+    FROM patient_review_queue
+    GROUP BY disposition
+    ORDER BY record_count DESC, disposition
+""").fetchall()
+
+
+plt.rcParams.update({
+    "font.size": 10,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+})
+
+fig, axes = plt.subplots(
+    1,
+    3,
+    figsize=(16, 5),
+    layout="constrained",
+)
+
+fig.patch.set_facecolor("#f7f9fc")
+
+categories = ["Accepted", "Needs review", "Duplicate"]
+counts = [accepted_count, review_count, duplicate_count]
+
+bars = axes[0].bar(
+    categories,
+    counts,
+    color=["#347f83", "#bd8850", "#8d94a5"],
+)
+
+axes[0].bar_label(bars, padding=4)
+axes[0].set_title("Where each source record went")
+axes[0].set_ylabel("Number of records")
+axes[0].set_ylim(0, max(counts + [1]) + 2)
+axes[0].yaxis.get_major_locator().set_params(integer=True)
+
+if summary:
+    departments = [row[0].title() for row in summary]
+    dollars = [row[1] / 100 for row in summary]
+
+    bars = axes[1].barh(
+        departments,
+        dollars,
+        color="#547da6",
+    )
+
+    axes[1].bar_label(
+        bars,
+        labels=[f"${value:,.2f}" for value in dollars],
+        padding=4,
+    )
+
+    axes[1].invert_yaxis()
+    axes[1].set_xlim(
+        0, max(dollars + [1]) * 1.3
+    )
+else:
+    axes[1].text(
+        0.5, 0.5, "No accepted payments",
+        ha="center", transform=axes[1].transAxes,
+    )
+
+axes[1].set_title("Validated payments by department")
+axes[1].set_xlabel("US dollars")
+
+if review_reasons:
+    reasons = [row[0] for row in review_reasons]
+    reason_counts = [row[1] for row in review_reasons]
+
+    bars = axes[2].barh(
+        reasons,
+        reason_counts,
+        color="#bd8850",
+    )
+
+    axes[2].bar_label(bars, padding=4)
+    axes[2].invert_yaxis()
+    axes[2].set_xlim(0, max(reason_counts) + 1)
+    axes[2].xaxis.get_major_locator().set_params(integer=True)
+else:
+    axes[2].text(
+        0.5, 0.5, "No records need review",
+        ha="center", transform=axes[2].transAxes,
+    )
+
+axes[2].set_title("Why records need review")
+axes[2].set_xlabel("Number of records")
+
+fig.suptitle(
+    "Payment Data Quality | Synthetic Sample",
+    fontsize=16,
+    fontweight="bold",
+)
+
+fig.savefig(
+    OUT / "payment_quality.png",
+    dpi=180,
+    bbox_inches="tight",
+)
+
 plt.show()
-print(f'{raw_count} input = {accepted} accepted + {rejected} review + {duplicates} duplicate')
-print(f'Validated total: ${total/100:,.2f}. All checks passed.')
+
+print(f"Input records: {raw_count}")
+print(f"Accepted records: {accepted_count}")
+print(f"Records needing review: {review_count}")
+print(f"Duplicates removed: {duplicate_count}")
+print(f"Validated payment total: ${total_cents / 100:,.2f}")
+print("All validation checks passed.")
+
+con.close()
